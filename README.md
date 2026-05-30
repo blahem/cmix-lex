@@ -115,8 +115,10 @@ Must run below `70000/T` hours. With `T=1200`:
 Install helper tools on Ubuntu if needed:
 
 ```bash
-./install_tools/install_upx.sh
-./install_tools/install_clang-17.sh
+sudo apt update
+sudo apt install build-essential libstdc++-14-dev
+bash ./install_tools/install_upx.sh
+bash ./install_tools/install_clang-17.sh
 ```
 
 UPX `5.1.1` is required for building the final packed executable on newer
@@ -127,7 +129,7 @@ or another confirmed UPX `5.1.1` binary.
 Build the self-extracting compressor:
 
 ```bash
-./build_and_construct_comp.sh
+bash ./build_and_construct_comp.sh
 ```
 
 The packaged compressor is written to:
