@@ -10,6 +10,7 @@ namespace fxcmv1 {
 
 public:
   Predictor();
+  ~Predictor();
   int p() ;
   void update();
 };
@@ -18,6 +19,7 @@ public:
 class FXCM : public Model {
  public:
   FXCM();
+  ~FXCM();
   const std::valarray<float>& Predict() const;
   const short* RawPredictions() const;
   const unsigned char* PredictionMask() const;

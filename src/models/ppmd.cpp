@@ -212,8 +212,18 @@ qword GetUsedMemory() {
 }
 
 void StopSubAllocator() {
-  if( SubAllocatorSize ) SubAllocatorSize=0, delete[] HeapStart;
-
+  if( !SubAllocatorSize ) return;
+  const qword size = SubAllocatorSize;
+  SubAllocatorSize = 0;
+  if (mmap_to_disk) {
+    if (munmap(HeapStart, size) != 0) {
+      exit(EXIT_FAILURE);
+    }
+  } else {
+    delete[] HeapStart;
+  }
+  HeapStart = NULL;
+  pText = UnitsStart = LoUnit = HiUnit = AuxUnit = NULL;
 }
 
 void GlueFreeBlocks() {
@@ -1325,7 +1335,7 @@ void processSymbol2_T( PPM_CONTEXT& q, int ) {
   }
 
   ~ppmd_Model() {
-    //StopSubAllocator();
+    StopSubAllocator();
   }
 
 void ppmd_PrepareByte( void ) {
@@ -1420,6 +1430,7 @@ PPMD::PPMD(int order, int memory, const unsigned int& bit_context,
 }
 
 PPMD::~PPMD() {
+  ppmd_model_.reset();
   if (mmap_to_disk) {
     remove(mmap_path);
   }

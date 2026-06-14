@@ -188,6 +188,10 @@ inline short clp1(int z){
     }
     return z;
 }
+inline int SarPow2(const int64_t v, const int shift) {
+    if (v >= 0) return int(v >> shift);
+    return -int(((-v) + ((int64_t(1) << shift) - 1)) >> shift);
+}
 int stretchc(int p) {
     assert(p>=0 && p<=4095);
     if (p==0) p=1;
@@ -208,12 +212,12 @@ inline short stretch(int p) {
 
 template <const int S=256>
 struct alignas(64) Inputs {
-    short n[S];
+    short n[S] = {};
     int ncount;     // mixer input count
     void add(int p){ 
         assert(p>-2048 && p<2048);// fixme, when enabled compression is different
         const short clipped=clp(p);
-        n[ncount++]=clipped;
+        if (ncount<S) n[ncount++]=clipped;
         assert(ncount>=0 && ncount<=S);
         // Predictive outputs are only generated for real model inputs.
         AddPredictionClipped(clipped);
@@ -221,8 +225,12 @@ struct alignas(64) Inputs {
     // Internal helper for mixer-only features that should not add model outputs.
     inline void add_internal(int p) {
         assert(p>-2048 && p<2048);
-        n[ncount++]=clp(p);
+        if (ncount<S) n[ncount++]=clp(p);
         assert(ncount>=0 && ncount<=S);
+    }
+    void clear() {
+        std::fill(n, n + S, 0);
+        ncount=0;
     }
 };
 
@@ -232,7 +240,7 @@ struct BlockData {
     int c0;       // Last 0-7 bits of the partial byte with a leading 1 bit (1-255)
     U32 c4;       // Last 4 whole bytes, packed.
     int bpos;     // bits in c0 (0 to 7)
-    int blpos;    // Relative position in block
+    U32 blpos;    // Relative position in block
     int bposshift;
     int c0shift_bpos;
     int cmBitState;
@@ -434,8 +442,14 @@ void loaddict(FILE  *file){
     int line_count=0,len=0;
     s=(char *)malloc(8192*8);
     while ((len=wfgets(s, 8192*8, file)) )  {
-        dictW[line_count]=(char *)malloc(len);
-        memcpy(dictW[line_count],  s, len);
+        if (line_count >= (int)(sizeof(dictW) / sizeof(dictW[0]))) {
+            fprintf(stderr, "Dictionary too large: %d entries (max %zu)\n",
+                line_count + 1, sizeof(dictW) / sizeof(dictW[0]));
+            exit(1);
+        }
+        dictW[line_count]=(char *)malloc((size_t)len + 1);
+        if (!dictW[line_count]) exit(1);
+        memcpy(dictW[line_count],  s, (size_t)len + 1);
         dictWLen[line_count]=U8(len-1);
         //printf("%d,%s\n",len,dictW[line_count]);
         if (cwTEXT==0 && strcmp(dictW[line_count], "text")==0) cwTEXT=line_count;
@@ -547,12 +561,18 @@ struct Mix {
     void update(int y) {
         assert(y==0 || y==1);
         int err=((y<<12)-squash(pr));
-        if ((wt[cxt]&3)<3)
-            err*=4-(++wt[cxt]&3);
+        if ((wt[cxt]&3)<3) {
+            ++wt[cxt];
+            err*=4-(wt[cxt]&3);
+        }
         err=(err+8)>>4;
         wt[cxt]+=x1*err&-4;
         wt[cxt+1]+=x2*err;
   }
+    void Free() {
+        free(wt);
+        wt=nullptr;
+    }
 };
 
 // Mixer m(N, M, S=1, w=0) combines models using M neural networks with
@@ -594,20 +614,40 @@ struct Mixer1 {
     int uperr;
     int err;
 
+    static inline int horizontal_sum_i32(YMM sum) {
+        XMM lo = _mm256_castsi256_si128(sum);
+        XMM hi = _mm256_extractf128_si256(sum, 1);
+        XMM s = _mm_add_epi32(lo, hi);
+        s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
+        s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
+        return _mm_cvtsi128_si32(s);
+    }
+
     int dot_product (const short* const t, const short* const w, int n) {
         assert(n == ((n + 15) & -16));
-        YMM sum = _mm256_setzero_si256 ();
-        while ((n -= 16) >= 0) { // Each loop sums 16 products
-            YMM tmp = _mm256_madd_epi16 (*(YMM *) &t[n], *(YMM *) &w[n]); // t[n] * w[n] + t[n+1] * w[n+1]
-            tmp = _mm256_srai_epi32 (tmp, 8); //                                        (t[n] * w[n] + t[n+1] * w[n+1]) >> 8
-            sum = _mm256_add_epi32 (sum, tmp); //                                sum += (t[n] * w[n] + t[n+1] * w[n+1]) >> 8
-        } 
-        sum =_mm256_hadd_epi32(sum,_mm256_setzero_si256 ());       //add [1]=[1]+[2], [2]=[3]+[4], [3]=0, [4]=0, [5]=[5]+[6], [6]=[7]+[8], [7]=0, [8]=0
-        sum =_mm256_hadd_epi32(sum,_mm256_setzero_si256 ());       //add [1]=[1]+[2], [2]=0,       [3]=0, [4]=0, [5]=[5]+[6], [6]=0,       [7]=0, [8]=0
-        XMM lo = _mm256_extractf128_si256(sum, 0);
-        XMM hi = _mm256_extractf128_si256(sum, 1);
-        XMM newsum = _mm_add_epi32(lo, hi);                    //sum last two
-        return _mm_cvtsi128_si32(newsum);
+        YMM sum0 = _mm256_setzero_si256();
+        YMM sum1 = _mm256_setzero_si256();
+        int i = 0;
+        for (; i + 31 < n; i += 32) {
+            const YMM t0 = _mm256_loadu_si256((const __m256i_u*)&t[i]);
+            const YMM w0 = _mm256_loadu_si256((const __m256i_u*)&w[i]);
+            const YMM t1 = _mm256_loadu_si256((const __m256i_u*)&t[i + 16]);
+            const YMM w1 = _mm256_loadu_si256((const __m256i_u*)&w[i + 16]);
+            YMM tmp0 = _mm256_madd_epi16(t0, w0);
+            YMM tmp1 = _mm256_madd_epi16(t1, w1);
+            tmp0 = _mm256_srai_epi32(tmp0, 8);
+            tmp1 = _mm256_srai_epi32(tmp1, 8);
+            sum0 = _mm256_add_epi32(sum0, tmp0);
+            sum1 = _mm256_add_epi32(sum1, tmp1);
+        }
+        for (; i < n; i += 16) {
+            const YMM tv = _mm256_loadu_si256((const __m256i_u*)&t[i]);
+            const YMM wv = _mm256_loadu_si256((const __m256i_u*)&w[i]);
+            YMM tmp = _mm256_madd_epi16(tv, wv);
+            tmp = _mm256_srai_epi32(tmp, 8);
+            sum0 = _mm256_add_epi32(sum0, tmp);
+        }
+        return horizontal_sum_i32(_mm256_add_epi32(sum0, sum1));
     }
 
     void train (const short* const t, short* const w, int n, const int e) {
@@ -615,13 +655,35 @@ struct Mixer1 {
         if (e) {
             const YMM one = _mm256_set1_epi16 (1);
             const YMM err = _mm256_set1_epi16 (short(e));
-            while ((n -= 16) >= 0) { // Each iteration adjusts 16 weights
-                YMM tmp = _mm256_adds_epi16 (*(YMM *) &t[n], *(YMM *) &t[n]); // t[n] * 2
+            int i = 0;
+            for (; i + 31 < n; i += 32) {
+                const YMM t0 = _mm256_loadu_si256((const __m256i_u*)&t[i]);
+                const YMM w0 = _mm256_loadu_si256((const __m256i_u*)&w[i]);
+                YMM tmp = _mm256_adds_epi16(t0, t0);
                 tmp = _mm256_mulhi_epi16 (tmp, err); //                                     (t[n] * 2 * err) >> 16
                 tmp = _mm256_adds_epi16 (tmp, one); //                                     ((t[n] * 2 * err) >> 16) + 1
                 tmp = _mm256_srai_epi16 (tmp, 1); //                                      (((t[n] * 2 * err) >> 16) + 1) >> 1
-                tmp = _mm256_adds_epi16 (tmp, *(YMM *) &w[n]); //                    ((((t[n] * 2 * err) >> 16) + 1) >> 1) + w[n]
-                *(YMM *) &w[n] = tmp; //                                          save the new eight weights, bounded to +- 32K
+                tmp = _mm256_adds_epi16(tmp, w0);
+                _mm256_storeu_si256((__m256i_u*)&w[i], tmp);
+
+                const YMM t1 = _mm256_loadu_si256((const __m256i_u*)&t[i + 16]);
+                const YMM w1 = _mm256_loadu_si256((const __m256i_u*)&w[i + 16]);
+                tmp = _mm256_adds_epi16(t1, t1);
+                tmp = _mm256_mulhi_epi16(tmp, err);
+                tmp = _mm256_adds_epi16(tmp, one);
+                tmp = _mm256_srai_epi16(tmp, 1);
+                tmp = _mm256_adds_epi16(tmp, w1);
+                _mm256_storeu_si256((__m256i_u*)&w[i + 16], tmp);
+            }
+            for (; i < n; i += 16) {
+                const YMM tv = _mm256_loadu_si256((const __m256i_u*)&t[i]);
+                const YMM wv = _mm256_loadu_si256((const __m256i_u*)&w[i]);
+                YMM tmp = _mm256_adds_epi16(tv, tv);
+                tmp = _mm256_mulhi_epi16(tmp, err);
+                tmp = _mm256_adds_epi16(tmp, one);
+                tmp = _mm256_srai_epi16(tmp, 1);
+                tmp = _mm256_adds_epi16(tmp, wv);
+                _mm256_storeu_si256((__m256i_u*)&w[i], tmp);
             }
         }
     }
@@ -667,12 +729,12 @@ for (int i=0; i<n; ++i) {
     // predict next bit
     inline int p() {
         assert(cxt>=0 && cxt<M);
-        int dp=dot_product(&tx[0], &wx[cxt*N], N)*shift1>>11;
+        int dp=int((int64_t(dot_product(&tx[0], &wx[cxt*N], N))*shift1)>>11);
         return pr=squash(dp);
     }
     inline int p1() {
         assert(cxt>=0 && cxt<M);
-        int dp=dot_product(&tx[0], &wx[cxt*N], N)*shift1>>11;
+        int dp=int((int64_t(dot_product(&tx[0], &wx[cxt*N], N))*shift1)>>11);
         if (dp<-2047) {
             dp=-2047;
         }
@@ -775,7 +837,8 @@ struct StateMap1 {
         U32 *p=&t[cxt], p0=p[0];
         int n=p0&1023, pr1=p0>>12;  // count, prediction
         p0+=(n<limit);
-        p0+=(((((x.y<<20)-pr1)))*dt[n]+512)&0xfffffc00;
+        const int64_t delta=(int64_t((x.y<<20)-pr1)*dt[n])+512;
+        p0+=(static_cast<U32>(delta)&0xfffffc00u);
         p[0]=p0;
     }
     // update bit y (0..1), predict next bit in context cx
@@ -833,13 +896,16 @@ struct RunContextMap {
         U16 chk=(i>>16^i)&0xffff;
         i=i*M&n;
         U8 *p;
-        U16 *cp1;
+        U16 cp1;
         int j;
         for (j=0; j<M; ++j) {
             p=&t[(i+j)*B];
-            cp1=(U16*)p;
-            if (p[2]==0) {*cp1=chk;break;}
-            if (*cp1==chk) break;  // found
+            memcpy(&cp1, p, sizeof(cp1));
+            if (p[2]==0) {
+                memcpy(p, &chk, sizeof(chk));
+                break;
+            }
+            if (cp1==chk) break;  // found
         }
         if (j==0) return p+1;  // front
         if (j==M) {
@@ -848,7 +914,7 @@ struct RunContextMap {
             memmove(&tmp, &chk, 2);
             if (M>2 && t[(i+j)*B+2]>t[(i+j-1)*B+2]) --j;
         }
-        else memcpy(&tmp, cp1, B);
+        else memcpy(&tmp, p, B);
         memmove(&t[(i+1)*B], &t[i*B], j*B);
         memcpy(&t[i*B], &tmp, B);
         return &t[i*B+1];
@@ -889,7 +955,7 @@ struct SmallStationaryContextMap {
     }
     void __attribute__ ((noinline)) mix(int r) {
         int rate =r +7; const int Multiplier=1;const int Divisor=4;
-        *cp+=((x.y<<16)-(*cp)+(1<<(rate-1)))>>rate;
+        *cp+=SarPow2((x.y<<16)-(*cp)+(1<<(rate-1)), rate);
         B+=(x.y && B>0);
         cp = &Data[Context+B];
         int Prediction = (*cp)>>4;
@@ -1012,6 +1078,9 @@ inline U32 getStateByteLocation(const int bpos, const int c0) {
 }
 
 #define MAXCXT 8
+inline U16 InitialContextMask(const int c) {
+    return c>1 ? U16(0) : U16(0xfffe);
+}
 short st2_p0[4096];
 short st2_p1[4096];
 short rcpr[512]; //2-6 0-4
@@ -1092,6 +1161,7 @@ struct ContextMap3 {
     int set(const int c,int i) {  
         assert(c>=0 && c<256);
         const int  pr=ts[c]>>20; // predict from current state
+        if (sti>=MAXCXT) return pr;
         // look if new state is same as state before, if so skip this state
         // if first state, set it
         if (i==0) {
@@ -1111,11 +1181,11 @@ struct ContextMap3 {
     } 
     // Construct using m bytes of memory for c contexts(c+7)&-8
     void __attribute__ ((noinline)) Init(U32 m1, int c1, int s2, int s3,const U8 *nn1,int cs4,int k, const int u,short *st) {
-        C=c1;
+        C=min(c1, MAXCXT);
         int m=m1*2;
         tmask=((m>>7)-1); 
         cn=result=0;
-        cxtMask=((1<C)-1)*2; // Inital zero contexts
+        cxtMask=InitialContextMask(C); // Inital zero contexts
         kep=k;
         alloc1(t,(m>>7)+64*2,ptr,128);  
         nn=nn1;        
@@ -1168,7 +1238,7 @@ struct ContextMap3 {
             runp[i]=cp[i]+3;
         }
         cn=result=sti=0;
-        cxtMask=((1<C)-1)*2;
+        cxtMask=InitialContextMask(C);
     }
     void Free() {
         free(ts);
@@ -1177,6 +1247,7 @@ struct ContextMap3 {
 
     // Set the i'th context to cx
     inline void set(U32 cx) {
+        if (cn>=C) return;
         int i=cn++;
         assert(i>=0 && i<C);
         cx=cx*987654323+i;  // permute (don't hash) cx to spread the distribution
@@ -1186,6 +1257,7 @@ struct ContextMap3 {
     }
 
     inline void sets() {
+        if (cn>=C) return;
         int i=cn++;
         assert(i>=0 && i<C);
         cxtMask=cxtMask+1; cxtMask=cxtMask*2;
@@ -1316,10 +1388,10 @@ struct ContextMap4 {
 
     // Construct using m bytes of memory for c contexts(c+7)&-8
     void __attribute__ ((noinline)) Init(U32 m, int c1, int s2, int s3,const U8 *nn1,int cs4,int k, const int u) {
-        C=c1;
+        C=min(c1, MAXCXT);
         tmask=((m>>6)-1); 
         cn=0;
-        cxtMask=((1<C)-1)*2; // Inital zero contexts
+        cxtMask=InitialContextMask(C); // Inital zero contexts
         result=0;
         kep=k;
         alloc1(t,(m>>6)+64,ptr,64);  
@@ -1365,7 +1437,7 @@ struct ContextMap4 {
             runp[i]=cp[i]+3;
         }
         cn=result=0;
-        cxtMask=((1<C)-1)*2;
+        cxtMask=InitialContextMask(C);
     }
     void Free() {
         free(ptr);
@@ -1373,6 +1445,7 @@ struct ContextMap4 {
 
     // Set the i'th context to cx
     inline void set(U32 cx) {
+        if (cn>=C) return;
         int i=cn++;
         assert(i>=0 && i<C);
         cx=cx*987654323+i;  // permute (don't hash) cx to spread the distribution
@@ -1382,6 +1455,7 @@ struct ContextMap4 {
     }
 
     inline void sets() {
+        if (cn>=C) return;
         int i=cn++;
         assert(i>=0 && i<C);
         cxtMask=cxtMask+1; cxtMask=cxtMask*2;
@@ -1497,8 +1571,8 @@ struct  APM {
     int p(int pr=2048, int cxt=0, int rate=8, int y=0) {
         pr=stretch(pr);
         int g=(y<<16)+(y<<rate)-y*2;
-        t[index]   += (g-t[index])   >> rate;
-        t[index+1] += (g-t[index+1]) >> rate;
+        t[index]   += SarPow2(g-t[index], rate);
+        t[index+1] += SarPow2(g-t[index+1], rate);
         const int w=pr&127;  // interpolation weight (33 points)
         index=((pr+2048)>>7)+(cxt&mask)*33;
         return clp1((t[index]*(128-w)+t[index+1]*w) >> 11);
@@ -1515,7 +1589,7 @@ struct  APM {
 
 int buf(int i);
 int bufr(int i);
-int pos;
+U32 pos;
 
 struct StationaryMap {
     U32 *Data;
@@ -1546,7 +1620,8 @@ struct StationaryMap {
         U32 p0=cp[0];
         int n=p0&1023, pr=p0>>13;  // count, prediction
         p0+=(n<1023);     
-        p0+=(((x.y<<19)-pr))*dt[n]&0xfffffc00;  
+        const int64_t delta=int64_t((x.y<<19)-pr)*dt[n];
+        p0+=(static_cast<U32>(delta)&0xfffffc00u);  
         cp[0]=p0;
         // predict
         B+=(x.y && B>0);
@@ -1667,13 +1742,15 @@ int vec_size(vec<T,S> *o) {
 }
 template <typename T  = int,const int S>
 void vec_push( vec<T,S> *o, const T element){
-    assert(o->size<S);
+    if (o->size>=S) {
+        o->size=S-1;
+    }
     o->cxt[o->size++]=element;
-    o->size=o->size&(o->capacity-1); // roll over
 }
 template <typename T  = int,const int S>
 int vec_at(vec<T,S> *o, const int index) {
     if (index<0) return 0;
+    if (index>=S) return 0;
     assert(index<S);
     return o->cxt[index];
 }
@@ -1684,12 +1761,17 @@ T &vec_ref(vec<T,S> *o, const int index) {
 }
 template <typename T  = int,const int S>
 void vec_i(vec<T,S> *o, const int index) {
+    if (index<0 || index>=S) return;
+    assert(index>=0 && index<S);
     o->cxt[index]++;
 }
 template <typename T  = int,const int S>
 void vec_pop(vec<T,S> *o) {
-    assert(o->size<S);
-    if (o->size>0) o->cxt[o->size]=0, o->size--; // no rollback
+    assert(o->size<=S);
+    if (o->size>0) {
+        --o->size;
+        o->cxt[o->size]=0; // no rollback
+    }
 }
 template <typename T  = int,const int S>
 void vec_reset(vec<T,S> *o) {
@@ -1803,24 +1885,24 @@ struct ColumnContext {
     }
    
     const U8 lastfc(int i=0) {
-        return col[(rows-i)&3].fc;
+        return col[(U32(rows)-U32(i))&3].fc;
     }
     void setlastfc(U8 f,int i=0) {
-        col[(rows-i)&3].fc=f;
+        col[(U32(rows)-U32(i))&3].fc=f;
     }
     bool isNewLine() {
         return NL;
     }
     int  __attribute__ ((noinline)) collen(int i=0,int l=0) {
-        return min((l?l:limit), vec_size(&col[(rows-i)&3].bytes)+1);
+        return min((l?l:limit), vec_size(&col[(U32(rows)-U32(i))&3].bytes)+1);
     }
-    int nlpos(int i=0) {
-        return col[(rows-i)&3].linepos;
+    U32 nlpos(int i=0) {
+        return col[(U32(rows)-U32(i))&3].linepos;
     }
     U8  __attribute__ ((noinline)) colb(int i=1,int j=0,int l=0) {
         const int idx=collen()-(1+j);
         if (idx>=0 && collen(0,l)<collen(i,l))
-        return  vec_at(&col[(rows-i)&3].bytes,idx);
+        return  vec_at(&col[(U32(rows)-U32(i))&3].bytes,idx);
         else return 0;
     }
     void __attribute__ ((noinline)) Update(int byte,int b2=0) {
@@ -1919,13 +2001,13 @@ struct ColumnContext {
         }
     }
     int cellsCount(int row=1) {
-        return vec_size(&cell[(cells-row)&3]);
+        return vec_size(&cell[(U32(cells)-U32(row))&3]);
     }
     int cellPos(int cellID,int row=1) {
         int total=cellsCount(row)-1;
         total=min(total,cellID);
         if (total<0) return 0;
-        return vec_at(&cell[(cells-row)&3],total);
+        return vec_at(&cell[(U32(cells)-U32(row))&3],total);
     }
     void resetCells() {
         for (int i=0;i<4;i++) vec_reset(&cell[i]);
@@ -2111,7 +2193,7 @@ struct WordsContext {
         else if (i==2) idx=53*83;
         else if (i==1) idx=83;
         if (lb==LF){
-            if (i==3) idx=idx*37;
+            if (i==4) idx=idx*37;
             else if (i==3) idx=idx*47;
             else if (i==2) idx=idx*53;
             else if (i==1) idx=idx*83;
@@ -2150,29 +2232,35 @@ struct SentenceContext {
         }
     }
     WordsContext *Sentence(int i) {
-        return &sentence[(sindex-i)&(SIMILARWORDS-1)];
+        return &sentence[(U32(sindex)-U32(i))&(SIMILARWORDS-1)];
     }
     WordsContext __attribute__ ((noinline)) *SimilarSentence(WordsContext *wor,int wcount,U32 pres=53) {
         U32 isSimilar=0,isSimilarIdx=0;
         U32 codesum=0; // input
         if (wcount>=1) {
+            const int maxCodes=64*4;
+            U32 curcode[maxCodes];
+            int curcount=0;
+            for (int k=0; k<wcount; k++) {
+                U32 code=wor->Code(wcount-k); // get word code of current sentence
+                if (code && curcount<maxCodes) curcode[curcount++]=code;
+            }
             for (int i=0; i<SIMILARWORDS; i++) {
                 if (sentence[i].wordcount && sentence[i].wordcount<= wcount && sentence[i].wordcount>(wcount/2)) {
-                    for (int k=0; k<wcount; k++) {
-                        U32 curcode=wor->Code(wcount-k); //get word code of current sentance
-                        // loop over and compare codewords
-                        if (curcode) {
-                            for (int j=0; j<sentence[i].wordcount; j++) {
-                                U32 testcode=sentence[i].Code(sentence[i].wordcount-j);
-                                if (testcode) {
-                                    U32 diff=(curcode-testcode);
-                                    if (diff==0) {
-                                        codesum++;
-                                        break;
-                                    }
-                                }
-                            } 
-                        }
+                    U32 testcode[maxCodes];
+                    int testcount=0;
+                    for (int j=0; j<sentence[i].wordcount; j++) {
+                        U32 code=sentence[i].Code(sentence[i].wordcount-j);
+                        if (code && testcount<maxCodes) testcode[testcount++]=code;
+                    }
+                    for (int k=0; k<curcount; k++) {
+                        for (int j=0; j<testcount; j++) {
+                            U32 diff=(curcode[k]-testcode[j]);
+                            if (diff==0) {
+                                codesum++;
+                                break;
+                            }
+                        } 
                     }
                     if (codesum> isSimilar) isSimilar=codesum,isSimilarIdx=i+1;
                     codesum=0;
@@ -2672,7 +2760,7 @@ private:
       cnt--;
     }
 
-    if ((*W)(0)=='-') {
+    if ((*W).Start!=(*W).End && (*W)(0)=='-') {
       (*W).End--;
     }
     return result;
@@ -3380,6 +3468,7 @@ struct XMLModel1 {
                     xlU4=(hash(pState, State, hash((*Attribute).Name, (*Content).Type )));
                     break;
                 }
+            case xReadCDATA:
             case xReadContent: {
                     if (B==LESSTHAN) {
                         State=xReadTagName;
@@ -3411,7 +3500,7 @@ struct XMLModel1 {
             isXML=(x.blpos-lastState)<64;
             xlU1=hash(State, (*Tag).Level, hash(pState*2+(*Tag).EndTag, (*Tag).Name));
             xlU2=hash((*pTag).Name, State*2+(*pTag).EndTag,hash( (*pTag).Content.Type, (*Tag).Content.Type));
-            xlU1=hash(State*2+(*Tag).EndTag, (*Tag).Name,hash( (*Tag).Content.Type, x.c4&0xE0FF));
+            xlU3=hash(State*2+(*Tag).EndTag, (*Tag).Name,hash( (*Tag).Content.Type, x.c4&0xE0FF));
         }
         U8 s = ((StateBH[State]>>(28-x.bpos))&0x08) |
         ((StateBH[State]>>(21-x.bpos))&0x04) |
@@ -3489,6 +3578,20 @@ struct DirectStateMap {
         x.mxInputs1.add((pu)>>2);
         index=pu=0;
     }
+    void Free() {
+        for (int i=0; i<count; ++i) {
+            sm[i].Free();
+            mmm[i].Free();
+        }
+        free(cxt);
+        free(CxtState);
+        free(sm);
+        free(mmm);
+        cxt=nullptr;
+        CxtState=nullptr;
+        sm=nullptr;
+        mmm=nullptr;
+    }
 };
 
 
@@ -3559,7 +3662,7 @@ U8  buffer[0x1000000];
 enum {BMASK=0xffffff};
 U8    cwbuf[0x1000];
 enum {CBMASK=0xfff};
-int cwpos=0;
+U32 cwpos=0;
 
 Word StemWords[4];
 Word *cWord, *pWord;
@@ -3842,10 +3945,25 @@ void PredictorFree() {
     smA[0].Free(); 
     smA[1].Free(); 
     smA[2].Free(); 
-    for (int i=0;i<11;i++) mxA[i].Free();
+    for (int i=0;i<4;i++) mmmO[i].Free();
+    for (int i=0;i<3;i++) scmA[i].Free();
+    maps1.Free();
+    maps2.Free();
+    dcsm.Free();
+    dcsm0.Free();
+    dcsm1.Free();
+    dcsm2.Free();
+    dcsmN.Free();
+    for (int i=0;i<18;i++) mxA[i].Free();
+    for (int i=0;i<6;i++) mxA1[i].Free();
+    for (int i=0;i<4;i++) mxA2[i].Free();
     for (int i=0;i<6;i++) cmC[i].Free();
-    for (int i=0;i<8;i++) cmC4[i].Free();
-    for (int i=0;i<18;i++) cmC2[i].Free();
+    cmC44.Free();
+    for (int i=0;i<9;i++) cmcr[i].Free();
+    for (int i=0;i<4;i++) cmcr2[i].Free();
+    for (int i=0;i<21;i++) cmC2[i].Free();
+    for (int i=0;i<9;i++) cmC4[i].Free();
+    for (int i=0;i<9;i++) cmCR[i].Free();
     for (int i=0;i<44515;i++) free(dictW[i]);
     rcmA[0].Free();
 }
@@ -4095,7 +4213,7 @@ int MatchModel2mix() {
     ctx[0] = (denselength << 4) | (expectedBit << 3) | x.bpos; // 1..28*2*8
     ctx[1] = ((expectedByte << 11) | (x.bpos << 8) | c1) ;//+ 1;
     const int sign = 2 * expectedBit - 1;
-    x.mxInputs1.add(sign * (length << 5));
+    x.mxInputs1.add(sign * int(length << 5));
   } else { // no match at all or delta mode
     x.mxInputs1.add(0);
   }
@@ -4719,7 +4837,7 @@ void parseByte() {
         }
         if (colcxt.isNewLine()) {
                 // Reset contexts when there are two empty lines
-                if ((colcxt.nlpos(0)+2-colcxt.nlpos(1))<4) { 
+                if ((int64_t(colcxt.nlpos(0))+2-int64_t(colcxt.nlpos(1)))<4) { 
                     fccxt.Reset();
                     htcxt.Reset(); 
                     worcxt0.Reset();
@@ -5329,7 +5447,8 @@ int modelPrediction() {
 
         U32 w4=(c4<<8)&0xff000000;
         // 3 bit stream of mapped chars, all chars above 127 are mapped to a-z range.
-        stream5b=(stream5b<<3) | (c1>127?wrt_3b['a']:wrt_3b[c1]);
+        const U8 c1u=static_cast<U8>(c1);
+        stream5b=(stream5b<<3) | (c1u>127?wrt_3b[static_cast<U8>('a')]:wrt_3b[c1u]);
         const U8 buf2=(c4>>8)&0xff;
         const U8 buf3=(c4>>16)&0xff;
         //sparse indirect 1-byte contexts
@@ -5407,6 +5526,7 @@ int modelPrediction() {
     ordX=ordX+cmC2[1].mix();
     ordX=ordX+cmC2[2].mix();
     ordX=ordX+cmC2[3].mix();
+    if (ordX>5) ordX=5;
     ordW=cmC2[4].mix();
     ordW=ordW+cmC2[5].mix();
     if (ordW>3) ordW=3;
@@ -5564,6 +5684,7 @@ int modelPrediction() {
        ordX=0;
     if (isMatch)
         ordX=ordX+1;
+    if (ordX>5) ordX=5;
     mxA[4].cxt=c + ordX*256+ 8*isParagraph;
 
     // mixer 5
@@ -5646,11 +5767,11 @@ void update() {
     for (int i=0;i<6;i++) mxA1[i].update(x.y);
     for (int i=0;i<4;i++) mxA2[i].update(x.y);
     //printf("mixer 0 predictor count %d\n",x.mxInputs1.ncount);
-    x.mxInputs1.ncount=0;
+    x.mxInputs1.clear();
     //printf("mixer 1 predictor count %d\n",x.mxInputs2.ncount);
-    x.mxInputs2.ncount=0;
+    x.mxInputs2.clear();
     //printf("mixer 2 predictor count %d\n",x.mxInputs4.ncount);
-    x.mxInputs4.ncount=0; 
+    x.mxInputs4.clear(); 
     //printf("mixer a2 predictor count %d\n",num_models);
 
     // This part is from paq8hp12
@@ -5702,10 +5823,10 @@ void update() {
     
     pu=stretch(pr);
     
-    mmmO[0].update(x.y),  pu=mmmO[0].pp(0,mp0,mstate);//clp this
-    mmmO[1].update(x.y),  pu=mmmO[1].pp(pu,mp1,mstate);
-    mmmO[2].update(x.y),  pu=mmmO[2].pp(pu,mp2,mstate);
-    mmmO[3].update(x.y),  pu=mmmO[3].pp(pu,mp3,mstate);
+    mmmO[0].update(x.y),  pu=clp(mmmO[0].pp(0,mp0,mstate));
+    mmmO[1].update(x.y),  pu=clp(mmmO[1].pp(pu,mp1,mstate));
+    mmmO[2].update(x.y),  pu=clp(mmmO[2].pp(pu,mp2,mstate));
+    mmmO[3].update(x.y),  pu=clp(mmmO[3].pp(pu,mp3,mstate));
     
     pr=(squash(clp(pu))+pr*3)>>2;
 }
@@ -5759,11 +5880,23 @@ inline void Predictor::update() {
     ResetPredictions();
 }
 
+Predictor::~Predictor() {
+    PredictorFree();
+    free(mhptr);
+    mhptr=nullptr;
+    mhashtable=nullptr;
+    free(model_predictions1_ptr);
+    model_predictions1_ptr=nullptr;
+    model_predictions1=nullptr;
+}
+
 }
 
 FXCM::FXCM() {
     predictor_.reset(new fxcmv1::Predictor());
 }
+
+FXCM::~FXCM() = default;
 
 const std::valarray<float>& FXCM::Predict() const{
     return fxcmv1::model_predictions;
