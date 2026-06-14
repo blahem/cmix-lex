@@ -5,6 +5,7 @@
 #include <vector>
 #include <string.h>
 #include <sys/stat.h>
+#include <malloc.h>
 
 #include "preprocess/preprocessor.h"
 #include "coder/encoder.h"
@@ -27,7 +28,7 @@ namespace {
 }
 
 int Help() {
-  printf("fx2-cmix\n");
+  printf("cmix-lex\n");
   printf("Compress:\n");
   printf("    to compress enwik9: cmix -e enwik9 [output]\n");
   printf("    to create a header for hutter prize: cmix -h comp_dict_size comp_new_order_size decomp_input_size\n");
@@ -305,15 +306,18 @@ bool RunDecompression(const std::string& input_path,
     fclose(data_out);
     return true;
   }
-  Predictor p(vocab);
-  if (dictionary_used) preprocessor::Pretrain(&p, dictionary);
+  {
+    Predictor p(vocab);
+    if (dictionary_used) preprocessor::Pretrain(&p, dictionary);
 
-  std::ofstream temp_out(temp_path, std::ios::out | std::ios::binary);
-  if (!temp_out.is_open()) return false;
+    std::ofstream temp_out(temp_path, std::ios::out | std::ios::binary);
+    if (!temp_out.is_open()) return false;
 
-  Decompress(*output_bytes, &data_in, &temp_out, &p);
-  data_in.close();
-  temp_out.close();
+    Decompress(*output_bytes, &data_in, &temp_out, &p);
+    data_in.close();
+    temp_out.close();
+  }
+  malloc_trim(0);
 
   if (post_wrt_side_path) {
     if (!r1_reorder::ExtractSideFromFile(temp_path, post_wrt_side_path) ||

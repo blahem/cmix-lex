@@ -31,6 +31,7 @@
 #include <cstring>
 #include <numeric>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -98,12 +99,30 @@ const size_t kEncodedRegime1Start = 13599801;
 const size_t kEncodedRegime2Start = 30372888;
 const unsigned char kD99Line[] = {0xDF, 0x99, 'N'};
 
+bool CheckedAdd(size_t a, size_t b, size_t* out) {
+  if (b > std::numeric_limits<size_t>::max() - a) return false;
+  *out = a + b;
+  return true;
+}
+
+bool SizeTFromU64(uint64_t value, size_t* out) {
+  if (value > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    return false;
+  }
+  *out = static_cast<size_t>(value);
+  return true;
+}
+
 bool ReadFile(const std::string& path, std::vector<unsigned char>* data) {
   std::ifstream in(path, std::ios::binary);
   if (!in.is_open()) return false;
   in.seekg(0, std::ios::end);
   const std::streamoff size = in.tellg();
   if (size < 0) return false;
+  if (static_cast<uint64_t>(size) >
+      static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    return false;
+  }
   in.seekg(0, std::ios::beg);
   data->resize(static_cast<size_t>(size));
   if (!data->empty()) {
@@ -122,6 +141,9 @@ bool WriteFile(const std::string& path, const std::vector<unsigned char>& data) 
 }
 
 size_t BodyEnd(const std::vector<unsigned char>& data, const LineRef& line) {
+  if (line.start > data.size() || line.len > data.size() - line.start) {
+    return line.start;
+  }
   size_t end = line.start + line.len;
   if (end > line.start && data[end - 1] == '\n') --end;
   if (end > line.start && data[end - 1] == '\r') --end;
@@ -134,7 +156,12 @@ bool ParseUnsignedAt(const std::vector<unsigned char>& data, size_t pos,
   if (pos >= end || data[pos] < '0' || data[pos] > '9') return false;
   uint64_t result = 0;
   while (pos < end && data[pos] >= '0' && data[pos] <= '9') {
-    result = result * 10 + static_cast<uint64_t>(data[pos] - '0');
+    const uint64_t digit = static_cast<uint64_t>(data[pos] - '0');
+    if (result >
+        (std::numeric_limits<uint64_t>::max() - digit) / 10) {
+      return false;
+    }
+    result = result * 10 + digit;
     ++pos;
   }
   *value = result;
@@ -146,7 +173,12 @@ bool ParseUnsignedExact(const std::vector<unsigned char>& data, size_t pos,
   if (pos >= end || data[pos] < '0' || data[pos] > '9') return false;
   uint64_t result = 0;
   while (pos < end && data[pos] >= '0' && data[pos] <= '9') {
-    result = result * 10 + static_cast<uint64_t>(data[pos] - '0');
+    const uint64_t digit = static_cast<uint64_t>(data[pos] - '0');
+    if (result >
+        (std::numeric_limits<uint64_t>::max() - digit) / 10) {
+      return false;
+    }
+    result = result * 10 + digit;
     ++pos;
   }
   if (pos != end) return false;
@@ -164,19 +196,33 @@ bool ParseSignedBody(const std::vector<unsigned char>& data,
     ++pos;
   }
   if (pos >= end || data[pos] < '0' || data[pos] > '9') return false;
-  int64_t result = 0;
+  const uint64_t limit = negative ?
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) + 1 :
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+  uint64_t result = 0;
   while (pos < end && data[pos] >= '0' && data[pos] <= '9') {
-    result = result * 10 + static_cast<int64_t>(data[pos] - '0');
+    const uint64_t digit = static_cast<uint64_t>(data[pos] - '0');
+    if (result > (limit - digit) / 10) return false;
+    result = result * 10 + digit;
     ++pos;
   }
   if (pos != end) return false;
-  *value = negative ? -result : result;
+  if (negative) {
+    if (result == limit) {
+      *value = std::numeric_limits<int64_t>::min();
+    } else {
+      *value = -static_cast<int64_t>(result);
+    }
+  } else {
+    *value = static_cast<int64_t>(result);
+  }
   return true;
 }
 
 std::vector<LineRef> SplitLines(size_t start, size_t len,
     const std::vector<unsigned char>& data) {
   std::vector<LineRef> lines;
+  if (start > data.size() || len > data.size() - start) return lines;
   const size_t end = start + len;
   size_t line_start = start;
   for (size_t i = start; i < end; ++i) {
@@ -193,6 +239,9 @@ bool ContainsBytes(const std::vector<unsigned char>& data, const LineRef& line,
     const char* text) {
   const size_t len = std::strlen(text);
   if (len == 0 || line.len < len) return false;
+  if (line.start > data.size() || line.len > data.size() - line.start) {
+    return false;
+  }
   const unsigned char* begin = data.data() + line.start;
   const unsigned char* end = begin + line.len - len + 1;
   for (const unsigned char* p = begin; p < end; ++p) {
@@ -204,8 +253,11 @@ bool ContainsBytes(const std::vector<unsigned char>& data, const LineRef& line,
 bool EndsWithBody(const std::vector<unsigned char>& data, const LineRef& line,
     const char* suffix) {
   const size_t len = std::strlen(suffix);
+  if (line.start > data.size() || line.len > data.size() - line.start) {
+    return false;
+  }
   const size_t end = BodyEnd(data, line);
-  return end >= line.start + len &&
+  return end >= line.start && end - line.start >= len &&
       std::memcmp(data.data() + end - len, suffix, len) == 0;
 }
 
@@ -254,7 +306,11 @@ bool ParseFirstD86a(const std::vector<unsigned char>& data,
   if (block.lines.size() < 2) return false;
   const LineRef& line = block.lines[1];
   const size_t end = BodyEnd(data, line);
-  if (end < line.start + sizeof(kD86Prefix)) return false;
+  size_t prefix_end = 0;
+  if (!CheckedAdd(line.start, sizeof(kD86Prefix), &prefix_end) ||
+      end < prefix_end) {
+    return false;
+  }
   if (std::memcmp(data.data() + line.start, kD86Prefix,
           sizeof(kD86Prefix)) != 0) {
     return false;
@@ -275,12 +331,18 @@ bool IsAsciiNumberLine(const std::vector<unsigned char>& data,
 
 void AppendRange(std::vector<unsigned char>* out,
     const std::vector<unsigned char>& data, const Range& range) {
+  if (range.start > data.size() || range.len > data.size() - range.start) {
+    return;
+  }
   out->insert(out->end(), data.begin() + range.start,
       data.begin() + range.start + range.len);
 }
 
 void AppendLine(std::vector<unsigned char>* out,
     const std::vector<unsigned char>& data, const LineRef& line) {
+  if (line.start > data.size() || line.len > data.size() - line.start) {
+    return;
+  }
   out->insert(out->end(), data.begin() + line.start,
       data.begin() + line.start + line.len);
 }
@@ -310,6 +372,7 @@ bool ReadVarint(const std::vector<unsigned char>& data, size_t end,
   int shift = 0;
   while (*pos < end && shift <= 63) {
     const unsigned char byte = data[(*pos)++];
+    if (shift == 63 && (byte & 0x7F) > 1) return false;
     result |= static_cast<uint64_t>(byte & 0x7F) << shift;
     if ((byte & 0x80) == 0) {
       *value = result;
@@ -347,7 +410,7 @@ class Fenwick {
   size_t FindByOrder(size_t rank) const {
     size_t index = 0;
     size_t bit = 1;
-    while ((bit << 1) < tree_.size()) bit <<= 1;
+    while (bit < tree_.size() / 2) bit <<= 1;
     while (bit != 0) {
       const size_t next = index + bit;
       if (next < tree_.size() && static_cast<size_t>(tree_[next]) <= rank) {
@@ -408,6 +471,9 @@ void ApplyDictionaryTextByteShuffle(std::string* bytes) {
 
 void AppendLineToString(std::string* out,
     const std::vector<unsigned char>& data, const LineRef& line) {
+  if (line.start > data.size() || line.len > data.size() - line.start) {
+    return;
+  }
   out->append(reinterpret_cast<const char*>(data.data() + line.start),
       line.len);
 }
@@ -416,26 +482,35 @@ bool FindPages(const std::vector<unsigned char>& data, size_t body_start,
     size_t body_len, Range* prelude, std::vector<Range>* pages) {
   static const char kPageStart[] = "  <page>\n";
   static const char kPageEnd[] = "  </page>\n";
+  if (body_start > data.size() || body_len > data.size() - body_start) {
+    return false;
+  }
   const size_t body_end = body_start + body_len;
+  const size_t page_start_len = sizeof(kPageStart) - 1;
+  const size_t page_end_len = sizeof(kPageEnd) - 1;
   size_t pos = body_start;
   pages->clear();
 
   while (pos < body_end) {
     size_t start = std::string::npos;
-    for (size_t i = pos; i + sizeof(kPageStart) - 1 <= body_end; ++i) {
-      if (std::memcmp(data.data() + i, kPageStart, sizeof(kPageStart) - 1) == 0) {
-        start = i;
-        break;
+    if (body_end - pos >= page_start_len) {
+      for (size_t i = pos; i <= body_end - page_start_len; ++i) {
+        if (std::memcmp(data.data() + i, kPageStart, page_start_len) == 0) {
+          start = i;
+          break;
+        }
       }
     }
     if (start == std::string::npos) break;
     if (pages->empty()) *prelude = {body_start, start - body_start};
 
     size_t end = std::string::npos;
-    for (size_t i = start; i + sizeof(kPageEnd) - 1 <= body_end; ++i) {
-      if (std::memcmp(data.data() + i, kPageEnd, sizeof(kPageEnd) - 1) == 0) {
-        end = i + sizeof(kPageEnd) - 1;
-        break;
+    if (body_end - start >= page_end_len) {
+      for (size_t i = start; i <= body_end - page_end_len; ++i) {
+        if (std::memcmp(data.data() + i, kPageEnd, page_end_len) == 0) {
+          end = i + page_end_len;
+          break;
+        }
       }
     }
     if (end == std::string::npos) return false;
@@ -506,7 +581,12 @@ bool ParseLangChunks(const std::vector<unsigned char>& data,
     if (cursor == start) return false;
     const size_t chunk_start = lang_lines[start].start;
     const LineRef& last = lang_lines[cursor - 1];
-    chunks->push_back({chunk_start, last.start + last.len - chunk_start});
+    size_t last_end = 0;
+    if (!CheckedAdd(last.start, last.len, &last_end) ||
+        last_end < chunk_start) {
+      return false;
+    }
+    chunks->push_back({chunk_start, last_end - chunk_start});
   }
   return true;
 }
@@ -523,6 +603,8 @@ bool AssignLangChunks(const std::vector<unsigned char>& data,
   for (const LineRef& line : body_lines) {
     ++lnu;
     while (page + 1 < pages.size() &&
+        pages[page].len <=
+            std::numeric_limits<size_t>::max() - pages[page].start &&
         line.start >= pages[page].start + pages[page].len) {
       ++page;
     }
@@ -605,7 +687,12 @@ std::vector<unsigned char> MakePayloadLexSide(
     size_t prelude_count, size_t suffix_count,
     const std::vector<size_t>& sorted_indices) {
   std::vector<unsigned char> out;
-  out.reserve(32 + sorted_indices.size() * 3);
+  size_t reserve_size = 0;
+  if (sorted_indices.size() <=
+      (std::numeric_limits<size_t>::max() - 32) / 3) {
+    reserve_size = 32 + sorted_indices.size() * 3;
+  }
+  out.reserve(reserve_size);
   out.insert(out.end(), kSideMagic, kSideMagic + sizeof(kSideMagic));
   AppendVarint(&out, tail_len);
   AppendVarint(&out, r0_count);
@@ -684,7 +771,12 @@ bool MakeD86aLehmerSide(size_t tail_len, size_t r0_count, size_t r1_count,
   }
 
   out->clear();
-  out->reserve(32 + original_by_d86a.size() * 3);
+  size_t reserve_size = 0;
+  if (original_by_d86a.size() <=
+      (std::numeric_limits<size_t>::max() - 32) / 3) {
+    reserve_size = 32 + original_by_d86a.size() * 3;
+  }
+  out->reserve(reserve_size);
   out->insert(out->end(), kSideMagicD86Lehmer,
       kSideMagicD86Lehmer + sizeof(kSideMagicD86Lehmer));
   AppendVarint(out, tail_len);
@@ -759,23 +851,25 @@ bool ParsePayloadLexSideMeta(const std::vector<unsigned char>& side,
   if (!ReadVarint(side, side.size(), &pos, &count)) return false;
   if (tail_len != expected_tail_len) return false;
 
-  meta->tail_len = static_cast<size_t>(tail_len);
-  meta->r0_count = static_cast<size_t>(r0_count);
-  meta->r1_count = static_cast<size_t>(r1_count);
-  meta->r2_count = static_cast<size_t>(r2_count);
-  meta->prelude_count = static_cast<size_t>(prelude_count);
-  meta->suffix_count = static_cast<size_t>(suffix_count);
+  size_t count_size = 0;
+  if (!SizeTFromU64(count, &count_size)) return false;
+  if (!SizeTFromU64(tail_len, &meta->tail_len)) return false;
+  if (!SizeTFromU64(r0_count, &meta->r0_count)) return false;
+  if (!SizeTFromU64(r1_count, &meta->r1_count)) return false;
+  if (!SizeTFromU64(r2_count, &meta->r2_count)) return false;
+  if (!SizeTFromU64(prelude_count, &meta->prelude_count)) return false;
+  if (!SizeTFromU64(suffix_count, &meta->suffix_count)) return false;
   meta->side_order = side_order;
 
   if (side_order == SideOrder::kD86aLehmer) {
-    if (!ReadLehmerPermutation(side, &pos, static_cast<size_t>(count),
+    if (!ReadLehmerPermutation(side, &pos, count_size,
             &meta->sorted_to_original)) {
       return false;
     }
   } else {
-    meta->sorted_to_original.assign(static_cast<size_t>(count), 0);
-    std::vector<unsigned char> seen(static_cast<size_t>(count), 0);
-    for (size_t i = 0; i < static_cast<size_t>(count); ++i) {
+    meta->sorted_to_original.assign(count_size, 0);
+    std::vector<unsigned char> seen(count_size, 0);
+    for (size_t i = 0; i < count_size; ++i) {
       uint64_t value64 = 0;
       if (!ReadVarint(side, side.size(), &pos, &value64)) return false;
       if (value64 >= count) return false;
@@ -799,14 +893,18 @@ bool PartitionEncodedTailLines(const std::vector<LineRef>& lines,
     if (pos < kEncodedRegime1Start) ++*r0_count;
     else if (pos < kEncodedRegime2Start) ++*r1_count;
     else ++*r2_count;
-    pos += line.len;
+    if (!CheckedAdd(pos, line.len, &pos)) return false;
   }
   return pos == kEncodedTailLen;
 }
 
 size_t GuessLastHugeBlockEnd(const std::vector<unsigned char>& data,
     const std::vector<LineRef>& lines, size_t start, size_t limit) {
-  size_t end = std::min(start + static_cast<size_t>(7), limit);
+  size_t tentative_end = 0;
+  if (!CheckedAdd(start, static_cast<size_t>(7), &tentative_end)) {
+    tentative_end = limit;
+  }
+  size_t end = std::min(tentative_end, limit);
   if (end < limit && IsAsciiNumberLine(data, lines[end])) {
     ++end;
     if (end < limit && !IsExactD99Line(data, lines[end])) {
@@ -873,7 +971,8 @@ bool ReorderPhda9MainFile(const std::string& path,
     return false;
   }
   if (tail_len64 == 0 || tail_len64 >= input.size()) return false;
-  const size_t tail_len = static_cast<size_t>(tail_len64);
+  size_t tail_len = 0;
+  if (!SizeTFromU64(tail_len64, &tail_len)) return false;
   const size_t tail_start = input.size() - tail_len;
 
   const size_t header_len_lf = std::find(input.begin() + tail_start,
@@ -893,10 +992,17 @@ bool ReorderPhda9MainFile(const std::string& path,
   }
 
   const size_t header_start = lang_len_lf + 1;
-  const size_t header_len = static_cast<size_t>(header_len64);
-  const size_t lang_len = static_cast<size_t>(lang_len64);
-  const size_t lang_start = header_start + header_len;
-  if (lang_start + lang_len != input.size()) return false;
+  size_t header_len = 0;
+  size_t lang_len = 0;
+  size_t lang_start = 0;
+  size_t lang_end = 0;
+  if (!SizeTFromU64(header_len64, &header_len) ||
+      !SizeTFromU64(lang_len64, &lang_len) ||
+      !CheckedAdd(header_start, header_len, &lang_start) ||
+      !CheckedAdd(lang_start, lang_len, &lang_end) ||
+      lang_end != input.size()) {
+    return false;
+  }
 
   Range body_prelude;
   std::vector<Range> pages;
@@ -982,7 +1088,9 @@ bool ReorderPhda9MainFile(const std::string& path,
   tail.insert(tail.end(), lang.begin(), lang.end());
 
   std::vector<unsigned char> output;
-  output.reserve(body.size() + tail.size());
+  size_t output_reserve = 0;
+  if (!CheckedAdd(body.size(), tail.size(), &output_reserve)) return false;
+  output.reserve(output_reserve);
   output.insert(output.end(), body.begin(), body.end());
   output.insert(output.end(), tail.begin(), tail.end());
   RewriteTailLengthLine(&output, tail.size());
@@ -1063,7 +1171,13 @@ bool ReorderEncodedTailFile(const std::string& path,
   if (!WriteFile(side_path, side)) return false;
 
   std::vector<unsigned char> output;
-  output.reserve(input.size() + side.size() + sizeof(kFooterMagic) + 8);
+  size_t output_reserve = 0;
+  if (!CheckedAdd(input.size(), side.size(), &output_reserve) ||
+      !CheckedAdd(output_reserve, sizeof(kFooterMagic) + 8,
+          &output_reserve)) {
+    return false;
+  }
+  output.reserve(output_reserve);
   output.insert(output.end(), input.begin(),
       input.begin() + kEncodedTailStart);
   output.insert(output.end(), transformed_tail.begin(),
@@ -1084,6 +1198,12 @@ bool AppendSideToFile(const std::string& path, const std::string& side_path) {
   std::vector<unsigned char> data;
   std::vector<unsigned char> side;
   if (!ReadFile(path, &data) || !ReadFile(side_path, &side)) return false;
+  size_t data_reserve = 0;
+  if (!CheckedAdd(data.size(), side.size(), &data_reserve) ||
+      !CheckedAdd(data_reserve, sizeof(kFooterMagic) + 8, &data_reserve)) {
+    return false;
+  }
+  data.reserve(data_reserve);
   data.insert(data.end(), side.begin(), side.end());
   data.insert(data.end(), kFooterMagic, kFooterMagic + sizeof(kFooterMagic));
   AppendU64LE(&data, side.size());
@@ -1105,7 +1225,8 @@ bool ExtractSideFromFile(const std::string& path,
     return false;
   }
   if (side_len64 > footer_pos) return false;
-  const size_t side_len = static_cast<size_t>(side_len64);
+  size_t side_len = 0;
+  if (!SizeTFromU64(side_len64, &side_len)) return false;
   const size_t side_pos = footer_pos - side_len;
   std::vector<unsigned char> side(data.begin() + side_pos,
       data.begin() + footer_pos);
@@ -1133,7 +1254,11 @@ bool RestoreEncodedTailFile(const std::string& path,
   std::vector<unsigned char> tail(input.begin() + kEncodedTailStart,
       input.end());
   std::vector<LineRef> lines = SplitLines(0, tail.size(), tail);
-  if (lines.size() != meta.r0_count + meta.r1_count + meta.r2_count) {
+  size_t r01_count = 0;
+  size_t total_count = 0;
+  if (!CheckedAdd(meta.r0_count, meta.r1_count, &r01_count) ||
+      !CheckedAdd(r01_count, meta.r2_count, &total_count) ||
+      lines.size() != total_count) {
     return false;
   }
 
@@ -1142,7 +1267,11 @@ bool RestoreEncodedTailFile(const std::string& path,
       lines.begin() + meta.r0_count + meta.r1_count);
   std::vector<LineRef> r2(lines.begin() + meta.r0_count + meta.r1_count,
       lines.end());
-  if (meta.prelude_count + meta.suffix_count > r1.size()) return false;
+  size_t frame_count = 0;
+  if (!CheckedAdd(meta.prelude_count, meta.suffix_count, &frame_count) ||
+      frame_count > r1.size()) {
+    return false;
+  }
 
   std::vector<LineRef> prelude(r1.begin(),
       r1.begin() + meta.prelude_count);
@@ -1236,7 +1365,8 @@ bool RestorePhda9MainFile(const std::string& path,
     return false;
   }
   if (tail_len64 == 0 || tail_len64 >= input.size()) return false;
-  const size_t tail_len = static_cast<size_t>(tail_len64);
+  size_t tail_len = 0;
+  if (!SizeTFromU64(tail_len64, &tail_len)) return false;
   const size_t tail_start = input.size() - tail_len;
 
   const size_t header_len_lf = std::find(input.begin() + tail_start,
@@ -1256,10 +1386,17 @@ bool RestorePhda9MainFile(const std::string& path,
   }
 
   const size_t header_start = lang_len_lf + 1;
-  const size_t header_len = static_cast<size_t>(header_len64);
-  const size_t lang_len = static_cast<size_t>(lang_len64);
-  const size_t lang_start = header_start + header_len;
-  if (lang_start + lang_len != input.size()) return false;
+  size_t header_len = 0;
+  size_t lang_len = 0;
+  size_t lang_start = 0;
+  size_t lang_end = 0;
+  if (!SizeTFromU64(header_len64, &header_len) ||
+      !SizeTFromU64(lang_len64, &lang_len) ||
+      !CheckedAdd(header_start, header_len, &lang_start) ||
+      !CheckedAdd(lang_start, lang_len, &lang_end) ||
+      lang_end != input.size()) {
+    return false;
+  }
 
   Range body_prelude;
   std::vector<Range> pages;
@@ -1325,7 +1462,9 @@ bool RestorePhda9MainFile(const std::string& path,
   tail.insert(tail.end(), lang.begin(), lang.end());
 
   std::vector<unsigned char> output;
-  output.reserve(tail_start + tail.size());
+  size_t output_reserve = 0;
+  if (!CheckedAdd(tail_start, tail.size(), &output_reserve)) return false;
+  output.reserve(output_reserve);
   output.insert(output.end(), input.begin(), input.begin() + tail_start);
   output.insert(output.end(), tail.begin(), tail.end());
   RewriteTailLengthLine(&output, tail.size());
