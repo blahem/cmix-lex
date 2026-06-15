@@ -10,16 +10,15 @@ namespace fxcmv1 {
 
 public:
   Predictor();
-  ~Predictor();
   int p() ;
   void update();
+  void FreeMemory();
 };
 }
 
 class FXCM : public Model {
  public:
   FXCM();
-  ~FXCM();
   const std::valarray<float>& Predict() const;
   const short* RawPredictions() const;
   const unsigned char* PredictionMask() const;
@@ -28,6 +27,7 @@ class FXCM : public Model {
   unsigned int NumOutputs();
   void Perceive(int bit);
   void ByteUpdate() {};
+  void FreeMemory();
 
  private:
   std::unique_ptr<fxcmv1::Predictor> predictor_;

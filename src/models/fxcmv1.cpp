@@ -5878,14 +5878,17 @@ inline void Predictor::update() {
     ResetPredictions();
 }
 
-Predictor::~Predictor() {
-    PredictorFree();
+void Predictor::FreeMemory() {
+    for (int i=0;i<21;i++) {
+        free(cmC2[i].ts);
+        cmC2[i].ts=nullptr;
+        free(cmC2[i].ptr);
+        cmC2[i].ptr=nullptr;
+        cmC2[i].t=nullptr;
+    }
     free(mhptr);
     mhptr=nullptr;
     mhashtable=nullptr;
-    free(model_predictions1_ptr);
-    model_predictions1_ptr=nullptr;
-    model_predictions1=nullptr;
 }
 
 }
@@ -5894,7 +5897,9 @@ FXCM::FXCM() {
     predictor_.reset(new fxcmv1::Predictor());
 }
 
-FXCM::~FXCM() = default;
+void FXCM::FreeMemory() {
+    predictor_->FreeMemory();
+}
 
 const std::valarray<float>& FXCM::Predict() const{
     return fxcmv1::model_predictions;
