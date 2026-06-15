@@ -314,11 +314,11 @@ bool RunDecompression(const std::string& input_path,
     if (!temp_out.is_open()) return false;
 
     Decompress(*output_bytes, &data_in, &temp_out, &p);
+    p.FreeFxcmMemory();
     data_in.close();
     temp_out.close();
   }
   malloc_trim(0);
-
   if (post_wrt_side_path) {
     if (!r1_reorder::ExtractSideFromFile(temp_path, post_wrt_side_path) ||
         !r1_reorder::RestoreEncodedTailFile(temp_path, post_wrt_side_path)) {

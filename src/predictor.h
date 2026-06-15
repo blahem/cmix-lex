@@ -41,6 +41,7 @@ class Predictor {
   float Predict();
   void Perceive(int bit);
   void Pretrain(int bit);
+  void FreeFxcmMemory();
 
  private:
   unsigned long long GetNumModels();

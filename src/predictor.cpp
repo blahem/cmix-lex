@@ -23,6 +23,10 @@ Predictor::Predictor(const std::vector<bool>& vocab) : manager_(),
   auxiliary_size_ = 2;
 }
 
+void Predictor::FreeFxcmMemory() {
+  fxcm_model_.FreeMemory();
+}
+
 unsigned long long Predictor::GetNumModels() {
   unsigned long long num = 0;
 
