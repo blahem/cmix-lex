@@ -30,9 +30,9 @@ prof_gen: CPPFLAGS_PART-THAT-SHOULD-BE-FAST += -fprofile-generate=$(ROOT_DIR)/pg
 prof_gen: LFLAGS                            += -fprofile-generate=$(ROOT_DIR)/pgo_data
 prof_gen: clean cmix
 
-prof_use: CPPFLAGS_PART-THAT-CAN-BE-SLOW    += -fprofile-use=$(ROOT_DIR)/pgo_data -flto
-prof_use: CPPFLAGS_PART-THAT-SHOULD-BE-FAST += -fprofile-use=$(ROOT_DIR)/pgo_data -flto
-prof_use: LFLAGS                            += -fprofile-use=$(ROOT_DIR)/pgo_data -flto
+prof_use: CPPFLAGS_PART-THAT-CAN-BE-SLOW    += -fprofile-use=$(ROOT_DIR)/pgo_data -flto=thin
+prof_use: CPPFLAGS_PART-THAT-SHOULD-BE-FAST += -fprofile-use=$(ROOT_DIR)/pgo_data -flto=thin
+prof_use: LFLAGS                            += -fprofile-use=$(ROOT_DIR)/pgo_data -flto=thin
 prof_use: clean cmix
 
 
