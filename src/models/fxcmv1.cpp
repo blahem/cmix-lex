@@ -2193,7 +2193,7 @@ struct WordsContext {
         else if (i==2) idx=53*83;
         else if (i==1) idx=83;
         if (lb==LF){
-            if (i==3) idx=idx*37;
+            if (i==4) idx=idx*37;
             else if (i==3) idx=idx*47;
             else if (i==2) idx=idx*53;
             else if (i==1) idx=idx*83;
@@ -3500,7 +3500,7 @@ struct XMLModel1 {
             isXML=(x.blpos-lastState)<64;
             xlU1=hash(State, (*Tag).Level, hash(pState*2+(*Tag).EndTag, (*Tag).Name));
             xlU2=hash((*pTag).Name, State*2+(*pTag).EndTag,hash( (*pTag).Content.Type, (*Tag).Content.Type));
-            xlU1=hash(State*2+(*Tag).EndTag, (*Tag).Name,hash( (*Tag).Content.Type, x.c4&0xE0FF));
+            xlU3=hash(State*2+(*Tag).EndTag, (*Tag).Name,hash( (*Tag).Content.Type, x.c4&0xE0FF));
         }
         U8 s = ((StateBH[State]>>(28-x.bpos))&0x08) |
         ((StateBH[State]>>(21-x.bpos))&0x04) |
@@ -5683,6 +5683,8 @@ int modelPrediction() {
        ordX=0;
     if (isMatch)
         ordX=ordX+1;
+    if (ordX>5)
+        ordX=5;
     mxA[4].cxt=c + ordX*256+ 8*isParagraph;
 
     // mixer 5
@@ -5821,10 +5823,10 @@ void update() {
     
     pu=stretch(pr);
     
-    mmmO[0].update(x.y),  pu=mmmO[0].pp(0,mp0,mstate);//clp this
-    mmmO[1].update(x.y),  pu=mmmO[1].pp(pu,mp1,mstate);
-    mmmO[2].update(x.y),  pu=mmmO[2].pp(pu,mp2,mstate);
-    mmmO[3].update(x.y),  pu=mmmO[3].pp(pu,mp3,mstate);
+    mmmO[0].update(x.y),  pu=clp(mmmO[0].pp(0,mp0,mstate));//clp this
+    mmmO[1].update(x.y),  pu=clp(mmmO[1].pp(pu,mp1,mstate));
+    mmmO[2].update(x.y),  pu=clp(mmmO[2].pp(pu,mp2,mstate));
+    mmmO[3].update(x.y),  pu=clp(mmmO[3].pp(pu,mp3,mstate));
     
     pr=(squash(clp(pu))+pr*3)>>2;
 }
