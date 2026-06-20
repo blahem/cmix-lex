@@ -35,17 +35,17 @@ objcopy --remove-section=.comment \
   --remove-section=.note.ABI-tag \
   cmix 2>/dev/null || true
 # LZMA-packed UPX is ~23 KB smaller than the default UCL mode on this binary.
-# UPX 3.94's LZMA loader crashes on current WSL2 kernels, so use the local
-# modern UPX installed by install_tools/install_upx.sh.
-UPX_BIN="${UPX_BIN:-./tools/upx}"
+# Use the exact local UPX installed by install_tools/install_upx.sh. Do not let
+# a stale UPX_BIN environment variable or PATH entry silently change packaging.
+UPX_BIN="./tools/upx"
 if [[ ! -x "$UPX_BIN" ]]; then
   echo "Missing executable UPX at $UPX_BIN. Run ./install_tools/install_upx.sh or set UPX_BIN." >&2
   exit 1
 fi
 UPX_VERSION_TEXT="$("$UPX_BIN" --version | head -n 1)"
 echo "Using $UPX_VERSION_TEXT"
-if [[ "$UPX_VERSION_TEXT" == upx\ 3.* ]]; then
-  echo "Refusing UPX 3.x for LZMA packing; its loader crashes under current WSL2." >&2
+if [[ "$UPX_VERSION_TEXT" != "upx 5.1.1" ]]; then
+  echo "Refusing UPX version '$UPX_VERSION_TEXT'; expected local UPX 5.1.1." >&2
   exit 1
 fi
 "$UPX_BIN" --ultra-brute cmix 
